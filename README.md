@@ -1,6 +1,6 @@
 # TCP Load Balancer
 
-[![CI](https://github.com/alaa157/TCP-Load-Balancer/actions/workflows/ci.yml/badge.svg)](https://github.com/alaa157/TCP-Load-Balancer/actions/workflows/ci.yml)
+[![CI](https://github.com/Alaa-Shehata1/TCP-Load-Balancer/actions/workflows/ci.yml/badge.svg)](https://github.com/Alaa-Shehata1/TCP-Load-Balancer/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)
 
 A Layer-4 TCP load balancer in Go: raw byte proxying, pluggable balancing
