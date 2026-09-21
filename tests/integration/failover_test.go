@@ -7,7 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -199,4 +203,118 @@ func TestFailover_MidStreamBackendDeath(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		return len(p.Healthy()) == 0
 	}, "dead backend ejected")
+}
+
+// dialBannerOnce opens one short-lived connection and returns its banner.
+func dialBannerOnce(proxyAddr string) (string, error) {
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+// TestFailover_ConcurrentSurvivorOnlyTraffic kills a backend, then hammers
+// the proxy with concurrent short-lived connections: every banner must
+// come from a survivor and nothing may panic or deadlock.
+func TestFailover_ConcurrentSurvivorOnlyTraffic(t *testing.T) {
+	addrA, _ := echoServer(t, "A")
+	addrB, killB := echoServer(t, "B")
+
+	p := pool.New([]config.BackendConfig{
+		{Name: "a", Addr: addrA},
+		{Name: "b", Addr: addrB},
+	})
+	b, err := balancer.New("round-robin", p)
+	if err != nil {
+		t.Fatalf("balancer: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	healthcheck.Start(ctx, p, 20*time.Millisecond, 10*time.Millisecond, 2, nil)
+
+	srv := proxy.New(p, b, 2*time.Second, 10*time.Second, slog.Default(), nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() { _ = srv.Serve(ln) }()
+	proxyAddr := ln.Addr().String()
+
+	killB()
+	time.Sleep(300 * time.Millisecond) // let the health checker eject B
+
+	const workers = 8
+	const perWorker = 15
+	type result struct {
+		banner string
+		err    error
+	}
+	results := make(chan result, workers*perWorker)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				banner, err := dialBannerOnce(proxyAddr)
+				results <- result{banner, err}
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	count := 0
+	for r := range results {
+		count++
+		if r.err != nil {
+			t.Fatalf("conn failed: %v", r.err)
+		}
+		if r.banner != "served-by:A" {
+			t.Fatalf("got %q after B died, want survivor A only", r.banner)
+		}
+	}
+	if count != workers*perWorker {
+		t.Fatalf("got %d results, want %d", count, workers*perWorker)
+	}
+}
+
+// TestMalformedConfig_ExitsNonZero builds the real binary and proves a
+// malformed listen address fails startup with a non-zero exit and the
+// field name in the output.
+func TestMalformedConfig_ExitsNonZero(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "bad.yaml")
+	doc := "listen_addr: \":99999\"\nadmin_addr: \":8080\"\n" +
+		"algorithm: \"round-robin\"\nbackends:\n" +
+		"  - {name: \"a\", host: \"127.0.0.1\", port: 9001}\n"
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+	}
+	bin := filepath.Join(dir, "lb")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/lb")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build lb: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, "--config", cfgPath).CombinedOutput()
+	if err == nil {
+		t.Fatalf("want non-zero exit, output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "listen_addr") {
+		t.Fatalf("output %q does not mention listen_addr", out)
+	}
 }

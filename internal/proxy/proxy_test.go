@@ -496,3 +496,96 @@ func TestProxy_MarksBackendUnhealthyOnReset(t *testing.T) {
 		return backendActive(p, rst) == 0
 	}, "backend active count back to zero")
 }
+
+// startStalledBackend accepts connections but never sends or echoes:
+// both proxy copy directions go idle.
+func startStalledBackend(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(io.Discard, conn)
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestProxy_StalledBackendClosesBothSides verifies an idle timeout closes
+// a stalled stream on both sides and the active count returns to zero.
+func TestProxy_StalledBackendClosesBothSides(t *testing.T) {
+	stalled := startStalledBackend(t)
+	p := pool.New([]config.BackendConfig{{Name: "stalled", Addr: stalled}})
+	b, _ := balancer.New("round-robin", p)
+	addr := startIdleProxy(t, p, b, 200*time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	// Neither side sends: the idle timeout must close the stream.
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+		t.Fatal("expected the stalled connection to close")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return backendActive(p, stalled) == 0
+	}, "backend active count back to zero")
+}
+
+// TestProxy_RecordsDialFailed verifies a backend that refuses the dial
+// records connections_total{result="dial_failed"} exactly once.
+func TestProxy_RecordsDialFailed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	dead := ln.Addr().String()
+	_ = ln.Close()
+
+	p := pool.New([]config.BackendConfig{{Name: "dead", Addr: dead}})
+	b, _ := balancer.New("round-robin", p)
+	addr, m := startProxy(t, p, b)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.Copy(io.Discard, conn) // expect prompt close
+	_ = conn.Close()
+
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.Connections.WithLabelValues("dead", "dial_failed")) == 1
+	}, "connections_total{backend=dead,result=dial_failed}==1")
+}
+
+// TestProxy_GaugeTracksActiveConn verifies backend_connections is 1 while
+// a stream is open and returns to 0 after it closes.
+func TestProxy_GaugeTracksActiveConn(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	addr, m := startProxy(t, p, b)
+
+	conn, _ := openProxiedConn(t, addr)
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.BackendConnections.WithLabelValues("a")) == 1
+	}, "backend_connections==1 while open")
+	_ = conn.Close()
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.BackendConnections.WithLabelValues("a")) == 0
+	}, "backend_connections==0 after close")
+}
