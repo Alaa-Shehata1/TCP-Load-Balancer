@@ -1,0 +1,37 @@
+services:
+  server-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.echo
+    command: ["--id", "A", "--port", "9001"]
+    ports: ["9001:9001"]
+    networks: [lbnet]
+  server-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.echo
+    command: ["--id", "B", "--port", "9001"]
+    ports: ["9002:9001"]
+    networks: [lbnet]
+  server-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.echo
+    command: ["--id", "C", "--port", "9001"]
+    ports: ["9003:9001"]
+    networks: [lbnet]
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+      - "8080:8080"
+    depends_on:
+      - server-a
+      - server-b
+      - server-c
+    networks: [lbnet]
+
+networks:
+  lbnet:
