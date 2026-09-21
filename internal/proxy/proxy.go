@@ -56,7 +56,7 @@ func (s *Server) HandleConn(client net.Conn) {
 	be := s.b.Next()
 	if be == nil {
 		s.log.Warn("no healthy backend", "conn", id)
-		client.Close()
+		_ = client.Close()
 		return
 	}
 	d := &net.Dialer{Timeout: s.dialTimeout}
@@ -66,14 +66,14 @@ func (s *Server) HandleConn(client net.Conn) {
 		s.p.MarkUnhealthy(be.Addr)
 		be2 := s.b.Next()
 		if be2 == nil || be2.Addr == be.Addr {
-			client.Close()
+			_ = client.Close()
 			return
 		}
 		up, err = d.DialContext(context.Background(), "tcp", be2.Addr)
 		if err != nil {
 			s.log.Warn("retry dial failed", "conn", id, "backend", be2.Addr, "err", err)
 			s.p.MarkUnhealthy(be2.Addr)
-			client.Close()
+			_ = client.Close()
 			return
 		}
 		be = be2
@@ -98,7 +98,7 @@ func (s *Server) HandleConn(client net.Conn) {
 		done <- struct{}{}
 	}()
 	<-done
-	client.Close()
-	up.Close()
+	_ = client.Close()
+	_ = up.Close()
 	s.log.Info("proxy done", "conn", id, "backend", be.Addr)
 }

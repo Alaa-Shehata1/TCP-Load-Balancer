@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
@@ -61,15 +62,14 @@ func main() {
 	admin := &http.Server{Addr: cfg.AdminAddr, Handler: metrics.New(p)}
 	go func() {
 		log.Info("admin listening", "addr", cfg.AdminAddr)
-		if err := admin.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("admin", "err", err)
 		}
 	}()
 
 	go func() {
-		if err := srv.Serve(ln); err != nil {
-			log.Info("proxy stopped", "err", err)
-		}
+		err := srv.Serve(ln) // returns only when the listener closes
+		log.Info("proxy stopped", "err", err)
 	}()
 
 	<-ctx.Done()

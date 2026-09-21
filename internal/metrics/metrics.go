@@ -48,12 +48,6 @@ func NewCounters(reg *prometheus.Registry) *Counters {
 	return c
 }
 
-// Handler bundles /health + /metrics.
-type Handler struct {
-	p   *pool.Pool
-	mux *http.ServeMux
-}
-
 // New builds an http.Handler serving /health and /metrics.
 func New(p *pool.Pool) http.Handler {
 	reg := prometheus.NewRegistry()

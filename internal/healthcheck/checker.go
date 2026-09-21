@@ -40,7 +40,7 @@ func checkLoop(ctx context.Context, p *pool.Pool, addr string, interval, timeout
 				}
 				continue
 			}
-			c.Close()
+			_ = c.Close()
 			if fails >= threshold {
 				slog.Info("healthcheck recovered", "backend", addr)
 			}

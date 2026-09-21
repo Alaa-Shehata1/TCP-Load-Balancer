@@ -32,13 +32,13 @@ func echoServer(t *testing.T, id string) (string, func()) {
 				return
 			}
 			go func(conn net.Conn) {
-				defer conn.Close()
-				fmt.Fprintf(conn, "served-by:%s\n", id)
+				defer func() { _ = conn.Close() }()
+				_, _ = fmt.Fprintf(conn, "served-by:%s\n", id)
 				_, _ = io.Copy(conn, conn)
 			}(c)
 		}
 	}()
-	return ln.Addr().String(), func() { ln.Close() }
+	return ln.Addr().String(), func() { _ = ln.Close() }
 }
 
 func dialBanner(t *testing.T, addr string) string {
@@ -47,7 +47,7 @@ func dialBanner(t *testing.T, addr string) string {
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -81,7 +81,7 @@ func TestFailover_KillOneBackendStillServes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() { _ = srv.Serve(ln) }()
 	proxyAddr := ln.Addr().String()
 

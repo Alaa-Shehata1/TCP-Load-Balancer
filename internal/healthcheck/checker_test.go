@@ -28,14 +28,14 @@ func TestChecker_HealthyStaysHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			c.Close()
+			_ = c.Close()
 		}
 	}()
 	addr := ln.Addr().String()
@@ -61,10 +61,10 @@ func TestChecker_RejoinsWhenBack(t *testing.T) {
 			if err != nil {
 				return
 			}
-			c.Close()
+			_ = c.Close()
 		}
 	}()
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	p := pool.New([]config.BackendConfig{{Name: "flap", Addr: addr}})
 	p.MarkUnhealthy(addr)

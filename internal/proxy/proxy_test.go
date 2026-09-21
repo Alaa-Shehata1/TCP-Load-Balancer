@@ -21,7 +21,7 @@ func startEcho(t *testing.T, id string) string {
 	if err != nil {
 		t.Fatalf("listen echo: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -29,8 +29,8 @@ func startEcho(t *testing.T, id string) string {
 				return
 			}
 			go func(conn net.Conn) {
-				defer conn.Close()
-				fmt.Fprintf(conn, "served-by:%s\n", id)
+				defer func() { _ = conn.Close() }()
+				_, _ = fmt.Fprintf(conn, "served-by:%s\n", id)
 				_, _ = io.Copy(conn, conn)
 			}(c)
 		}
@@ -45,7 +45,7 @@ func startProxy(t *testing.T, p *pool.Pool, b balancer.Balancer) string {
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() { _ = s.Serve(ln) }()
 	return ln.Addr().String()
 }
@@ -64,7 +64,7 @@ func TestProxy_ForwardsToBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	rd := bufio.NewReader(conn)
 	line, err := rd.ReadString('\n')
@@ -92,7 +92,7 @@ func TestProxy_NoHealthy_ClosesFast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
 	_, err = conn.Read(buf)
@@ -109,7 +109,7 @@ func TestProxy_SkipsDeadBackend(t *testing.T) {
 	// dead port: listen then close to get a free-but-closed addr
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	dead := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	p := pool.New([]config.BackendConfig{
 		{Name: "dead", Addr: dead},
@@ -123,7 +123,7 @@ func TestProxy_SkipsDeadBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	rd := bufio.NewReader(conn)
 	line, err := rd.ReadString('\n')

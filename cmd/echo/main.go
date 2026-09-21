@@ -23,8 +23,8 @@ func main() {
 			continue
 		}
 		go func(conn net.Conn) {
-			defer conn.Close()
-			fmt.Fprintf(conn, "served-by:%s\n", *id)
+			defer func() { _ = conn.Close() }()
+			_, _ = fmt.Fprintf(conn, "served-by:%s\n", *id)
 			_, _ = io.Copy(conn, conn)
 		}(c)
 	}
