@@ -1,17 +1,18 @@
-.PHONY: build test vet lint demo down smoke
+.PHONY: build test vet lint demo demo-host down smoke
 
 build:
 	go build ./...
 
 test:
-	go test -race ./...
+	go test -count=1 -race ./...
 
 vet:
 	go vet ./...
-	gofmt -l .
+	test -z "$$(gofmt -l .)"
 
 lint:
-	golangci-lint run ./... || echo "(install golangci-lint for full lint)"
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "error: golangci-lint not installed (see https://golangci-lint.run/docs/welcome/install/)"; exit 1; }
+	golangci-lint run ./...
 
 demo:
 	docker compose up -d --build
