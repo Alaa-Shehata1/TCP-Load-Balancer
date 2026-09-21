@@ -1,0 +1,11 @@
+$ docker stop tcp-load-balancer-server-b-1
+tcp-load-balancer-server-b-1
+$ python3 scripts/demo.py 6
+conn0: served-by:A
+conn1: served-by:A
+conn2: served-by:C
+conn3: served-by:A
+conn4: served-by:C
+conn5: served-by:A
+$ curl -s localhost:8080/health
+{"healthy":2,"total":3}

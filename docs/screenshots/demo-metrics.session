@@ -1,0 +1,7 @@
+$ curl -s localhost:8080/metrics | grep -E 'connections_total|bytes_tx|bytes_rx|backend_connections'
+connections_total{backend="server-a",result="ok"} 2
+connections_total{backend="server-b",result="ok"} 2
+connections_total{backend="server-c",result="ok"} 2
+bytes_tx{backend="server-a"} 0
+bytes_rx{backend="server-a"} 24
+backend_connections{backend="server-a"} 0

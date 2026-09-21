@@ -9,19 +9,27 @@ Prometheus observability — with a one-command Docker failover demo.
 
 Built to learn networking + systems + concurrency, and to show it.
 
+```mermaid
+graph TD
+    Client["Client"] --> LB["LB<br/>:9000 TCP · :8080 admin"]
+    LB --> A["server-a :9001"]
+    LB --> B["server-b :9002"]
+    LB --> C["server-c :9003"]
 ```
-                 Client
-                   │
-                   ▼
-             ┌───────────┐
-             │    LB     │  :9000 (TCP)  +  :8080 (/health, /metrics)
-             └─────┬─────┘
-                   │
-        ┌──────────┼──────────┐
-        ▼          ▼          ▼
-     Server A   Server B   Server C
-     :9001      :9002      :9003
-```
+
+## Screenshots
+
+Round-robin rotation across three backends:
+
+![Round-robin demo](docs/screenshots/demo-rotation.png)
+
+Failover after `docker stop server-b` — traffic continues on survivors:
+
+![Failover demo](docs/screenshots/demo-failover.png)
+
+Prometheus metrics with real per-backend values:
+
+![Metrics](docs/screenshots/demo-metrics.png)
 
 ## Features
 

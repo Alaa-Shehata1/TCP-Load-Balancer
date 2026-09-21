@@ -1,0 +1,9 @@
+$ python3 scripts/demo.py 6
+conn0: served-by:A
+conn1: served-by:B
+conn2: served-by:C
+conn3: served-by:A
+conn4: served-by:B
+conn5: served-by:C
+$ curl -s localhost:8080/health
+{"healthy":3,"total":3}
