@@ -10,8 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/alaa157/tcp-load-balancer/internal/balancer"
 	"github.com/alaa157/tcp-load-balancer/internal/config"
+	"github.com/alaa157/tcp-load-balancer/internal/metrics"
 	"github.com/alaa157/tcp-load-balancer/internal/pool"
 )
 
@@ -38,16 +41,29 @@ func startEcho(t *testing.T, id string) string {
 	return ln.Addr().String()
 }
 
-func startProxy(t *testing.T, p *pool.Pool, b balancer.Balancer) string {
+func startProxy(t *testing.T, p *pool.Pool, b balancer.Balancer) (string, *metrics.Metrics) {
 	t.Helper()
-	s := New(p, b, 2*time.Second, 10*time.Second, slog.Default())
+	_, m := metrics.New(p)
+	s := New(p, b, 2*time.Second, 10*time.Second, slog.Default(), m)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() { _ = s.Serve(ln) }()
-	return ln.Addr().String()
+	return ln.Addr().String(), m
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 func TestProxy_ForwardsToBackend(t *testing.T) {
@@ -58,7 +74,7 @@ func TestProxy_ForwardsToBackend(t *testing.T) {
 		{Name: "b", Addr: a2},
 	})
 	b, _ := balancer.New("round-robin", p)
-	addr := startProxy(t, p, b)
+	addr, _ := startProxy(t, p, b)
 
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -85,7 +101,7 @@ func TestProxy_NoHealthy_ClosesFast(t *testing.T) {
 	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
 	p.MarkUnhealthy(a1)
 	b, _ := balancer.New("round-robin", p)
-	addr := startProxy(t, p, b)
+	addr, _ := startProxy(t, p, b)
 
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -117,7 +133,7 @@ func TestProxy_SkipsDeadBackend(t *testing.T) {
 	})
 	// Force RR to hit dead first: fresh RR starts at index 0 = dead
 	b, _ := balancer.New("round-robin", p)
-	addr := startProxy(t, p, b)
+	addr, _ := startProxy(t, p, b)
 
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -130,4 +146,63 @@ func TestProxy_SkipsDeadBackend(t *testing.T) {
 	if err != nil || !strings.Contains(line, "GOOD") {
 		t.Fatalf("want GOOD backend, got %q err=%v", line, err)
 	}
+}
+
+func TestProxy_RecordsOkMetrics(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	addr, m := startProxy(t, p, b)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	rd := bufio.NewReader(conn)
+	banner, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatalf("banner: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "hello\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if echo, err := rd.ReadString('\n'); err != nil || strings.TrimSpace(echo) != "hello" {
+		t.Fatalf("echo=%q err=%v", echo, err)
+	}
+	_ = conn.Close()
+
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.Connections.WithLabelValues("a", "ok")) == 1
+	}, "connections_total{backend=a,result=ok}==1")
+	if got := testutil.ToFloat64(m.BytesTx.WithLabelValues("a")); got != 6 {
+		t.Fatalf("bytes_tx=%v want 6", got)
+	}
+	wantRx := float64(len(banner) + len("hello\n"))
+	if got := testutil.ToFloat64(m.BytesRx.WithLabelValues("a")); got != wantRx {
+		t.Fatalf("bytes_rx=%v want %v", got, wantRx)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.BackendConnections.WithLabelValues("a")) == 0
+	}, "backend_connections==0")
+}
+
+func TestProxy_RecordsNoHealthy(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	p.MarkUnhealthy(a1)
+	b, _ := balancer.New("round-robin", p)
+	addr, m := startProxy(t, p, b)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.Copy(io.Discard, conn)
+	_ = conn.Close()
+
+	waitFor(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.Connections.WithLabelValues("none", "no_healthy")) == 1
+	}, "connections_total{result=no_healthy}==1")
 }

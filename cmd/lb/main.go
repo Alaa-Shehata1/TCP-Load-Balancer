@@ -43,14 +43,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	adminHandler, lbMetrics := metrics.New(p)
+
 	healthcheck.Start(ctx, p,
 		time.Duration(cfg.Healthcheck.IntervalSecs)*time.Second,
 		time.Duration(cfg.Healthcheck.TimeoutSecs)*time.Second,
-		cfg.Healthcheck.FailThreshold)
+		cfg.Healthcheck.FailThreshold, lbMetrics)
 
 	srv := proxy.New(p, b,
 		time.Duration(cfg.Timeouts.DialSecs)*time.Second,
-		time.Duration(cfg.Timeouts.IdleSecs)*time.Second, log)
+		time.Duration(cfg.Timeouts.IdleSecs)*time.Second, log, lbMetrics)
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -59,7 +61,7 @@ func main() {
 	}
 	log.Info("lb listening", "addr", cfg.ListenAddr, "algo", cfg.Algorithm)
 
-	admin := &http.Server{Addr: cfg.AdminAddr, Handler: metrics.New(p)}
+	admin := &http.Server{Addr: cfg.AdminAddr, Handler: adminHandler}
 	go func() {
 		log.Info("admin listening", "addr", cfg.AdminAddr)
 		if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

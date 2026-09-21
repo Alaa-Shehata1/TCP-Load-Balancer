@@ -74,9 +74,9 @@ func TestFailover_KillOneBackendStillServes(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	healthcheck.Start(ctx, p, 20*time.Millisecond, 10*time.Millisecond, 2)
+	healthcheck.Start(ctx, p, 20*time.Millisecond, 10*time.Millisecond, 2, nil)
 
-	srv := proxy.New(p, b, 2*time.Second, 5*time.Second, slog.Default())
+	srv := proxy.New(p, b, 2*time.Second, 5*time.Second, slog.Default(), nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)

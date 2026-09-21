@@ -7,22 +7,23 @@ import (
 	"net"
 	"time"
 
+	"github.com/alaa157/tcp-load-balancer/internal/metrics"
 	"github.com/alaa157/tcp-load-balancer/internal/pool"
 )
 
 // Start launches a checker goroutine per backend. It marks a backend
 // unhealthy after threshold consecutive dial failures and readmits it
 // on the first successful dial. Stops when ctx is done.
-func Start(ctx context.Context, p *pool.Pool, interval, timeout time.Duration, threshold int) {
+func Start(ctx context.Context, p *pool.Pool, interval, timeout time.Duration, threshold int, m *metrics.Metrics) {
 	if threshold <= 0 {
 		threshold = 2
 	}
 	for _, b := range p.All() {
-		go checkLoop(ctx, p, b.Addr, interval, timeout, threshold)
+		go checkLoop(ctx, p, b, interval, timeout, threshold, m)
 	}
 }
 
-func checkLoop(ctx context.Context, p *pool.Pool, addr string, interval, timeout time.Duration, threshold int) {
+func checkLoop(ctx context.Context, p *pool.Pool, b *pool.Backend, interval, timeout time.Duration, threshold int, m *metrics.Metrics) {
 	fails := 0
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -31,21 +32,22 @@ func checkLoop(ctx context.Context, p *pool.Pool, addr string, interval, timeout
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c, err := net.DialTimeout("tcp", addr, timeout)
+			c, err := net.DialTimeout("tcp", b.Addr, timeout)
 			if err != nil {
 				fails++
+				m.HealthFailed(metrics.BackendLabel(b.Name, b.Addr))
 				if fails >= threshold {
-					p.MarkUnhealthy(addr)
-					slog.Warn("healthcheck failed", "backend", addr, "fails", fails, "err", err)
+					p.MarkUnhealthy(b.Addr)
+					slog.Warn("healthcheck failed", "backend", b.Addr, "fails", fails, "err", err)
 				}
 				continue
 			}
 			_ = c.Close()
 			if fails >= threshold {
-				slog.Info("healthcheck recovered", "backend", addr)
+				slog.Info("healthcheck recovered", "backend", b.Addr)
 			}
 			fails = 0
-			p.MarkHealthy(addr)
+			p.MarkHealthy(b.Addr)
 		}
 	}
 }
