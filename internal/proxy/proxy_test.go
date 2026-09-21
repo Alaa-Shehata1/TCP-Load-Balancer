@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,8 +190,13 @@ func TestProxy_RecordsOkMetrics(t *testing.T) {
 
 func TestProxy_RecordsNoHealthy(t *testing.T) {
 	a1 := startEcho(t, "A")
-	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	a2 := startEcho(t, "B")
+	p := pool.New([]config.BackendConfig{
+		{Name: "a", Addr: a1},
+		{Name: "b", Addr: a2},
+	})
 	p.MarkUnhealthy(a1)
+	p.MarkUnhealthy(a2)
 	b, _ := balancer.New("round-robin", p)
 	addr, m := startProxy(t, p, b)
 
@@ -499,8 +505,9 @@ func TestProxy_MarksBackendUnhealthyOnReset(t *testing.T) {
 
 // startStalledBackend accepts connections but never sends or echoes:
 // both proxy copy directions go idle.
-func startStalledBackend(t *testing.T) string {
+func startStalledBackend(t *testing.T) (string, *atomic.Int64) {
 	t.Helper()
+	var active atomic.Int64
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -513,18 +520,20 @@ func startStalledBackend(t *testing.T) string {
 				return
 			}
 			go func(conn net.Conn) {
+				active.Add(1)
+				defer active.Add(-1)
 				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(io.Discard, conn)
 			}(c)
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), &active
 }
 
 // TestProxy_StalledBackendClosesBothSides verifies an idle timeout closes
 // a stalled stream on both sides and the active count returns to zero.
 func TestProxy_StalledBackendClosesBothSides(t *testing.T) {
-	stalled := startStalledBackend(t)
+	stalled, backendSockets := startStalledBackend(t)
 	p := pool.New([]config.BackendConfig{{Name: "stalled", Addr: stalled}})
 	b, _ := balancer.New("round-robin", p)
 	addr := startIdleProxy(t, p, b, 200*time.Millisecond)
@@ -542,6 +551,9 @@ func TestProxy_StalledBackendClosesBothSides(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		return backendActive(p, stalled) == 0
 	}, "backend active count back to zero")
+	waitFor(t, 2*time.Second, func() bool {
+		return backendSockets.Load() == 0
+	}, "stalled backend socket closed")
 }
 
 // TestProxy_RecordsDialFailed verifies a backend that refuses the dial

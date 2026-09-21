@@ -99,11 +99,7 @@ func TestFailover_KillOneBackendStillServes(t *testing.T) {
 
 	// Kill B (like `docker stop server-b`).
 	killB()
-	time.Sleep(200 * time.Millisecond) // let healthcheck eject B
-
-	if got := len(p.Healthy()); got != 1 {
-		t.Fatalf("want 1 healthy got %d", got)
-	}
+	waitFor(t, 2*time.Second, func() bool { return len(p.Healthy()) == 1 }, "one healthy backend after B stops")
 
 	// All further traffic must reach A.
 	for i := 0; i < 4; i++ {
@@ -250,7 +246,7 @@ func TestFailover_ConcurrentSurvivorOnlyTraffic(t *testing.T) {
 	proxyAddr := ln.Addr().String()
 
 	killB()
-	time.Sleep(300 * time.Millisecond) // let the health checker eject B
+	waitFor(t, 2*time.Second, func() bool { return len(p.Healthy()) == 1 }, "one healthy backend after B stops")
 
 	const workers = 8
 	const perWorker = 15
