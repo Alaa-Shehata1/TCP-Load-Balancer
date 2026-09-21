@@ -3,10 +3,12 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +26,7 @@ type Server struct {
 	log         *slog.Logger
 	m           *metrics.Metrics
 	conns       atomic.Uint64
+	wg          sync.WaitGroup
 }
 
 // New builds a proxy server. m may be nil, in which case no metrics
@@ -35,14 +38,37 @@ func New(p *pool.Pool, b balancer.Balancer, dialTimeout, idleTimeout time.Durati
 	return &Server{p: p, b: b, dialTimeout: dialTimeout, idleTimeout: idleTimeout, log: log, m: m}
 }
 
-// Serve accepts connections until the listener closes.
+// Serve accepts connections until the listener closes. Closing the
+// listener is the normal stop signal and returns nil.
 func (s *Server) Serve(l net.Listener) error {
 	for {
 		c, err := l.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			return fmt.Errorf("accept: %w", err)
 		}
+		s.wg.Add(1)
 		go s.HandleConn(c)
+	}
+}
+
+// Shutdown waits for in-flight handlers to finish. The caller must close
+// the listener first so no new handlers start. It returns ctx.Err() if the
+// drain deadline expires first. The internal waiter goroutine always
+// terminates: handlers are bounded by the idle timeout, so Wait returns.
+func (s *Server) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -57,6 +83,7 @@ func closeWrite(c net.Conn) {
 // connections_total outcome (no_healthy, dial_failed, or ok) and keeps the
 // backend gauge accurate via a single deferred cleanup.
 func (s *Server) HandleConn(client net.Conn) {
+	defer s.wg.Done()
 	id := s.conns.Add(1)
 	be := s.b.Next()
 	if be == nil {

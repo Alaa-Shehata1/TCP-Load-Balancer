@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -122,7 +124,6 @@ func TestProxy_NoHealthy_ClosesFast(t *testing.T) {
 
 func TestProxy_SkipsDeadBackend(t *testing.T) {
 	good := startEcho(t, "GOOD")
-	// dead port: listen then close to get a free-but-closed addr
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	dead := ln.Addr().String()
 	_ = ln.Close()
@@ -131,7 +132,6 @@ func TestProxy_SkipsDeadBackend(t *testing.T) {
 		{Name: "dead", Addr: dead},
 		{Name: "good", Addr: good},
 	})
-	// Force RR to hit dead first: fresh RR starts at index 0 = dead
 	b, _ := balancer.New("round-robin", p)
 	addr, _ := startProxy(t, p, b)
 
@@ -205,4 +205,115 @@ func TestProxy_RecordsNoHealthy(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		return testutil.ToFloat64(m.Connections.WithLabelValues("none", "no_healthy")) == 1
 	}, "connections_total{result=no_healthy}==1")
+}
+
+// startDrainProxy starts a proxy whose listener is closed only by the caller.
+// The returned stop function unblocks Serve; call it to begin the drain.
+func startDrainProxy(t *testing.T, p *pool.Pool, b balancer.Balancer) (*Server, func(), net.Listener) {
+	t.Helper()
+	_, m := metrics.New(p)
+	s := New(p, b, 2*time.Second, 30*time.Second, slog.Default(), m)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(ln) }()
+	stopServe := func() { _ = ln.Close() }
+	// Wait for listener to be accepting.
+	for i := 0; i < 50; i++ {
+		if c, err := net.DialTimeout("tcp", ln.Addr().String(), 10*time.Millisecond); err == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return s, stopServe, ln
+}
+
+func openProxiedConn(t *testing.T, proxyAddr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	rd := bufio.NewReader(conn)
+	if _, err := rd.ReadString('\n'); err != nil {
+		_ = conn.Close()
+		t.Fatalf("banner: %v", err)
+	}
+	return conn, rd
+}
+
+// TestProxy_DrainWaitsForHandlers verifies: no new accepts after listener close,
+// existing handler stays usable, and Shutdown blocks until the handler exits.
+func TestProxy_DrainWaitsForHandlers(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	s, stopServe, ln := startDrainProxy(t, p, b)
+	proxyAddr := ln.Addr().String()
+
+	conn, rd := openProxiedConn(t, proxyAddr)
+
+	// Begin drain: stop accepting new connections.
+	stopServe()
+	if c2, err := net.DialTimeout("tcp", proxyAddr, 500*time.Millisecond); err == nil {
+		_ = c2.Close()
+		t.Fatal("accepted a connection after the listener closed")
+	}
+
+	// Existing connection must stay usable during the drain window.
+	if _, err := fmt.Fprintf(conn, "ping\n"); err != nil {
+		t.Fatalf("write during drain: %v", err)
+	}
+	if line, err := rd.ReadString('\n'); err != nil || strings.TrimSpace(line) != "ping" {
+		t.Fatalf("echo during drain=%q err=%v", line, err)
+	}
+
+	// Shutdown must wait for the open handler.
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+	select {
+	case <-time.After(100 * time.Millisecond):
+		// still draining — correct so far
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown returned while a handler was still open: %v", err)
+	}
+
+	_ = conn.Close()
+	done := make(chan struct{})
+	go func() {
+		_ = s.Shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after the handler closed")
+	}
+}
+
+// TestProxy_DrainTimesOut verifies Shutdown returns ctx.DeadlineExceeded
+// when a handler never exits (simulated by an unclosable backend).
+func TestProxy_DrainTimesOut(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	s, stopServe, ln := startDrainProxy(t, p, b)
+	proxyAddr := ln.Addr().String()
+
+	conn, _ := openProxiedConn(t, proxyAddr)
+	defer func() { _ = conn.Close() }()
+
+	// Close listener first so no new handlers start.
+	stopServe()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown=%v want DeadlineExceeded", err)
+	}
 }

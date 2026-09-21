@@ -77,8 +77,16 @@ func main() {
 	<-ctx.Done()
 	log.Info("draining: stop accept")
 	_ = ln.Close()
+	stop() // cancel health checks now (also deferred)
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = admin.Shutdown(shutCtx)
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
+		log.Warn("drain timed out with handlers still open", "err", err)
+	} else {
+		log.Info("drain complete")
+	}
 	log.Info("bye")
 }
