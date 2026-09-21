@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -69,6 +70,9 @@ func Load(path string) (Config, error) {
 		if bc.Host == "" {
 			return c, fmt.Errorf("backend %q is missing host", bc.Name)
 		}
+		if !validBackendHost(bc.Host) {
+			return c, fmt.Errorf("backend %q has invalid host %q", bc.Name, bc.Host)
+		}
 		bc.Addr = net.JoinHostPort(bc.Host, fmt.Sprint(bc.Port))
 		if prev, ok := seen[bc.Addr]; ok {
 			return c, fmt.Errorf("backend %q has duplicate address %q (already used by %q)",
@@ -122,4 +126,29 @@ func Load(path string) (Config, error) {
 		c.Timeouts.IdleSecs = 60
 	}
 	return c, nil
+}
+
+func validBackendHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if strings.ContainsAny(host, " \t\r\n/\\") || strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		return false
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+				(r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return len(host) <= 253
 }

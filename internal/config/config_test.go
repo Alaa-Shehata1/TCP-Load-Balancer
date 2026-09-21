@@ -85,6 +85,8 @@ func TestLoad_Invalid(t *testing.T) {
 		{"malformed admin addr",
 			"listen_addr: \":9000\"\nadmin_addr: \"not-an-address\"\n" +
 				"algorithm: \"round-robin\"\nbackends:\n" + validBackend + foot, "admin_addr"},
+		{"malformed backend host",
+			header + "  - {name: \"a\", host: \"bad host\", port: 9001}\n" + foot, "backend"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
