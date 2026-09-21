@@ -61,6 +61,17 @@ func (p *Pool) Healthy() []*Backend {
 	return out
 }
 
+// All returns all backends in config order (healthy or not).
+func (p *Pool) All() []*Backend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*Backend, 0, len(p.order))
+	for _, addr := range p.order {
+		out = append(out, p.byAddr[addr])
+	}
+	return out
+}
+
 // MarkUnhealthy excludes a backend from picking.
 func (p *Pool) MarkUnhealthy(addr string) {
 	p.mu.RLock()
