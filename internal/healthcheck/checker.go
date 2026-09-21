@@ -15,6 +15,12 @@ import (
 // unhealthy after threshold consecutive dial failures and readmits it
 // on the first successful dial. Stops when ctx is done.
 func Start(ctx context.Context, p *pool.Pool, interval, timeout time.Duration, threshold int, m *metrics.Metrics) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
 	if threshold <= 0 {
 		threshold = 2
 	}
@@ -27,13 +33,17 @@ func checkLoop(ctx context.Context, p *pool.Pool, b *pool.Backend, interval, tim
 	fails := 0
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	dialer := &net.Dialer{Timeout: timeout}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c, err := net.DialTimeout("tcp", b.Addr, timeout)
+			c, err := dialer.DialContext(ctx, "tcp", b.Addr)
 			if err != nil {
+				if ctx.Err() != nil {
+					return // shutting down, not a backend failure
+				}
 				fails++
 				m.HealthFailed(metrics.BackendLabel(b.Name, b.Addr))
 				if fails >= threshold {

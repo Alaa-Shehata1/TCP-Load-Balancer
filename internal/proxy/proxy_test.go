@@ -318,6 +318,27 @@ func TestProxy_DrainTimesOut(t *testing.T) {
 	}
 }
 
+func TestProxy_ShutdownRejectsNewConnections(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	s, _, ln := startDrainProxy(t, p, b)
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 500*time.Millisecond)
+	if err != nil {
+		return // The listener may already have been closed by the test cleanup.
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := bufio.NewReader(conn).ReadByte(); err == nil {
+		t.Fatal("connection accepted after shutdown")
+	}
+}
+
 func startIdleProxy(t *testing.T, p *pool.Pool, b balancer.Balancer, idle time.Duration) string {
 	t.Helper()
 	_, m := metrics.New(p)
@@ -424,5 +445,54 @@ func TestProxy_BackendEOFClosesClient(t *testing.T) {
 	}
 	waitFor(t, 2*time.Second, func() bool {
 		return backendActive(p, beAddr) == 0
+	}, "backend active count back to zero")
+}
+
+// startResetBackend accepts connections and immediately resets them
+// (zero linger), simulating a backend crash mid-stream.
+func startResetBackend(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0)
+			}
+			_ = c.Close()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestProxy_MarksBackendUnhealthyOnReset verifies passive failure marking:
+// a backend reset mid-stream ejects the backend for new connections and
+// the handler still cleans up.
+func TestProxy_MarksBackendUnhealthyOnReset(t *testing.T) {
+	rst := startResetBackend(t)
+	p := pool.New([]config.BackendConfig{{Name: "rst", Addr: rst}})
+	b, _ := balancer.New("round-robin", p)
+	addr, _ := startProxy(t, p, b)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.Copy(io.Discard, conn) // expect prompt EOF
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(p.Healthy()) == 0
+	}, "reset backend ejected")
+	waitFor(t, 2*time.Second, func() bool {
+		return backendActive(p, rst) == 0
 	}, "backend active count back to zero")
 }

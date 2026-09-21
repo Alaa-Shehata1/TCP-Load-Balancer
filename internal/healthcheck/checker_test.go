@@ -3,6 +3,7 @@ package healthcheck
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,4 +102,45 @@ func TestChecker_RecordsHealthFailure(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		return testutil.ToFloat64(m.HealthFailures.WithLabelValues("dead")) >= 2
 	}, "health_check_failures_total>=2")
+}
+
+func TestChecker_CancelStopsDials(t *testing.T) {
+	var accepts atomic.Int64
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			_ = c.Close()
+		}
+	}()
+	p := pool.New([]config.BackendConfig{{Name: "live", Addr: ln.Addr().String()}})
+	_, m := metrics.New(p)
+	ctx, cancel := context.WithCancel(context.Background())
+	Start(ctx, p, 20*time.Millisecond, 10*time.Millisecond, 1000, m)
+	waitFor(t, 2*time.Second, func() bool {
+		return accepts.Load() >= 2
+	}, "checker dials")
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	n := accepts.Load()
+	time.Sleep(150 * time.Millisecond)
+	if got := accepts.Load(); got != n {
+		t.Fatalf("checker kept dialing after cancel: %d -> %d", n, got)
+	}
+}
+
+func TestChecker_NonPositiveIntervalDoesNotPanic(t *testing.T) {
+	p := pool.New([]config.BackendConfig{{Name: "live", Addr: "127.0.0.1:1"}})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	Start(ctx, p, 0, -1, 0, nil) // must apply defaults, not panic
+	<-ctx.Done()
 }

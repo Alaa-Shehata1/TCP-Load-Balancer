@@ -26,6 +26,8 @@ type Server struct {
 	log         *slog.Logger
 	m           *metrics.Metrics
 	conns       atomic.Uint64
+	lifecycleMu sync.Mutex
+	draining    bool
 	wg          sync.WaitGroup
 }
 
@@ -49,7 +51,14 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
+		s.lifecycleMu.Lock()
+		if s.draining {
+			s.lifecycleMu.Unlock()
+			_ = c.Close()
+			return nil
+		}
 		s.wg.Add(1)
+		s.lifecycleMu.Unlock()
 		go s.HandleConn(c)
 	}
 }
@@ -59,6 +68,10 @@ func (s *Server) Serve(l net.Listener) error {
 // drain deadline expires first. The internal waiter goroutine always
 // terminates: handlers are bounded by the idle timeout, so Wait returns.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	s.draining = true
+	s.lifecycleMu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -79,16 +92,22 @@ func closeWrite(c net.Conn) {
 }
 
 // readIdle refreshes the wrapped connection's read deadline whenever a
-// read makes progress. Use it on the source side of io.Copy.
+// read makes progress. Use it on the source side of io.Copy. It records
+// the first non-EOF read error for failure attribution; each instance is
+// owned by a single copy goroutine.
 type readIdle struct {
-	c    net.Conn
-	idle time.Duration
+	c       net.Conn
+	idle    time.Duration
+	readErr error
 }
 
-func (r readIdle) Read(b []byte) (int, error) {
+func (r *readIdle) Read(b []byte) (int, error) {
 	n, err := r.c.Read(b)
 	if n > 0 {
 		_ = r.c.SetReadDeadline(time.Now().Add(r.idle))
+	}
+	if err != nil && err != io.EOF && r.readErr == nil {
+		r.readErr = err
 	}
 	return n, err
 }
@@ -96,16 +115,27 @@ func (r readIdle) Read(b []byte) (int, error) {
 // writeIdle refreshes the wrapped connection's write deadline whenever a
 // write makes progress. Use it on the destination side of io.Copy.
 type writeIdle struct {
-	c    net.Conn
-	idle time.Duration
+	c        net.Conn
+	idle     time.Duration
+	writeErr error
 }
 
-func (w writeIdle) Write(b []byte) (int, error) {
+func (w *writeIdle) Write(b []byte) (int, error) {
 	n, err := w.c.Write(b)
 	if n > 0 {
 		_ = w.c.SetWriteDeadline(time.Now().Add(w.idle))
 	}
+	if err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
 	return n, err
+}
+
+// backendFault reports whether err identifies a backend failure: a reset,
+// refused connection, timeout, or other I/O error. Clean EOF, a nil error,
+// and our own cleanup closes (net.ErrClosed) are not backend faults.
+func backendFault(err error) bool {
+	return err != nil && err != io.EOF && !errors.Is(err, net.ErrClosed)
 }
 
 // isIdleTimeout reports whether err is a deadline-exceeded network error.
@@ -182,17 +212,21 @@ func (s *Server) HandleConn(client net.Conn) {
 
 	var tx, rx atomic.Int64
 	var errC2B, errB2C error
+	c2bSrc := &readIdle{c: client, idle: s.idleTimeout}
+	c2bDst := &writeIdle{c: up, idle: s.idleTimeout}
+	b2cSrc := &readIdle{c: up, idle: s.idleTimeout}
+	b2cDst := &writeIdle{c: client, idle: s.idleTimeout}
 	done := make(chan struct{}, 2)
 	go func() {
 		var n int64
-		n, errC2B = io.Copy(writeIdle{up, s.idleTimeout}, readIdle{client, s.idleTimeout})
+		n, errC2B = io.Copy(c2bDst, c2bSrc)
 		tx.Add(n)
 		closeWrite(up)
 		done <- struct{}{}
 	}()
 	go func() {
 		var n int64
-		n, errB2C = io.Copy(writeIdle{client, s.idleTimeout}, readIdle{up, s.idleTimeout})
+		n, errB2C = io.Copy(b2cDst, b2cSrc)
 		rx.Add(n)
 		closeWrite(client)
 		done <- struct{}{}
@@ -201,6 +235,19 @@ func (s *Server) HandleConn(client net.Conn) {
 	_ = client.Close()
 	_ = up.Close()
 	<-done // both copies always signal; closing unblocks the other side
+	// Passive failure marking: backend-side I/O errors (reset, refused,
+	// timeout) eject the backend for new connections. Clean EOF (normal
+	// close by either side), our own cleanup closes, and pure
+	// client-side disconnects never mark. Timeouts count: a backend that
+	// cannot produce or accept bytes within the idle window is suspect;
+	// the active checker readmits it on the next successful dial.
+	if backendFault(b2cSrc.readErr) || backendFault(c2bDst.writeErr) {
+		s.p.MarkUnhealthy(be.Addr)
+		s.log.Warn("proxy ejecting backend after stream failure",
+			"conn", id, "backend", be.Addr,
+			"backendReadErr", errString(b2cSrc.readErr),
+			"backendWriteErr", errString(c2bDst.writeErr))
+	}
 	s.m.AddTx(label, float64(tx.Load()))
 	s.m.AddRx(label, float64(rx.Load()))
 	s.m.ConnResult(label, "ok")
