@@ -1,0 +1,9 @@
+listen_addr: ":9000"
+admin_addr: ":8080"
+algorithm: "round-robin"
+backends:
+  - {name: "server-a", host: "127.0.0.1", port: 9001}
+  - {name: "server-b", host: "127.0.0.1", port: 9002}
+  - {name: "server-c", host: "127.0.0.1", port: 9003}
+healthcheck: {interval_secs: 5, timeout_secs: 2, fail_threshold: 2}
+timeouts: {dial_secs: 3, idle_secs: 60}
