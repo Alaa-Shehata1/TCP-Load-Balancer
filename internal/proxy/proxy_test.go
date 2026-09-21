@@ -317,3 +317,112 @@ func TestProxy_DrainTimesOut(t *testing.T) {
 		t.Fatalf("Shutdown=%v want DeadlineExceeded", err)
 	}
 }
+
+func startIdleProxy(t *testing.T, p *pool.Pool, b balancer.Balancer, idle time.Duration) string {
+	t.Helper()
+	_, m := metrics.New(p)
+	s := New(p, b, 2*time.Second, idle, slog.Default(), m)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = s.Serve(ln) }()
+	return ln.Addr().String()
+}
+
+// TestProxy_IdleKeepsActiveStreamAlive sends traffic periodically for much
+// longer than the idle timeout: an inactivity (not absolute) timeout must
+// keep the stream open. Afterwards it stops and expects closure after
+// approximately one idle interval.
+func TestProxy_IdleKeepsActiveStreamAlive(t *testing.T) {
+	a1 := startEcho(t, "A")
+	p := pool.New([]config.BackendConfig{{Name: "a", Addr: a1}})
+	b, _ := balancer.New("round-robin", p)
+	addr := startIdleProxy(t, p, b, 300*time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	rd := bufio.NewReader(conn)
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatalf("banner: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := fmt.Fprintf(conn, "tick\n"); err != nil {
+			t.Fatalf("tick %d write: %v", i, err)
+		}
+		line, err := rd.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) != "tick" {
+			t.Fatalf("tick %d echo=%q err=%v", i, line, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Idle now: both sides must close after ~one interval.
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := rd.ReadString('\n'); err == nil {
+		t.Fatal("expected the idle connection to close")
+	}
+}
+
+// startClosingBackend accepts connections, sends one line, then closes
+// (backend EOF).
+func startClosingBackend(t *testing.T) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = fmt.Fprintln(c, "bye")
+			_ = c.Close()
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func backendActive(p *pool.Pool, addr string) int64 {
+	for _, b := range p.All() {
+		if b.Addr == addr {
+			return b.Active()
+		}
+	}
+	return -1
+}
+
+// TestProxy_BackendEOFClosesClient verifies a backend EOF reaches the
+// client and the handler cleans up (active count back to zero).
+func TestProxy_BackendEOFClosesClient(t *testing.T) {
+	beAddr, kill := startClosingBackend(t)
+	defer kill()
+	p := pool.New([]config.BackendConfig{{Name: "eof", Addr: beAddr}})
+	b, _ := balancer.New("round-robin", p)
+	addr := startIdleProxy(t, p, b, 5*time.Second)
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	rd := bufio.NewReader(conn)
+	if line, err := rd.ReadString('\n'); err != nil || strings.TrimSpace(line) != "bye" {
+		t.Fatalf("banner=%q err=%v", line, err)
+	}
+	// Backend closed: client must observe EOF promptly.
+	if _, err := rd.ReadString('\n'); err == nil {
+		t.Fatal("expected EOF after backend close")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return backendActive(p, beAddr) == 0
+	}, "backend active count back to zero")
+}

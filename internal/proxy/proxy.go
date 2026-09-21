@@ -78,10 +78,58 @@ func closeWrite(c net.Conn) {
 	}
 }
 
+// readIdle refreshes the wrapped connection's read deadline whenever a
+// read makes progress. Use it on the source side of io.Copy.
+type readIdle struct {
+	c    net.Conn
+	idle time.Duration
+}
+
+func (r readIdle) Read(b []byte) (int, error) {
+	n, err := r.c.Read(b)
+	if n > 0 {
+		_ = r.c.SetReadDeadline(time.Now().Add(r.idle))
+	}
+	return n, err
+}
+
+// writeIdle refreshes the wrapped connection's write deadline whenever a
+// write makes progress. Use it on the destination side of io.Copy.
+type writeIdle struct {
+	c    net.Conn
+	idle time.Duration
+}
+
+func (w writeIdle) Write(b []byte) (int, error) {
+	n, err := w.c.Write(b)
+	if n > 0 {
+		_ = w.c.SetWriteDeadline(time.Now().Add(w.idle))
+	}
+	return n, err
+}
+
+// isIdleTimeout reports whether err is a deadline-exceeded network error.
+func isIdleTimeout(err error) bool {
+	var ne net.Error
+	return err != nil && errors.As(err, &ne) && ne.Timeout()
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 // HandleConn picks a backend, dials with timeout (one retry on next backend),
-// then pipes bytes both ways with idle deadlines. It records exactly one
+// then pipes bytes both ways with inactivity deadlines. It records exactly one
 // connections_total outcome (no_healthy, dial_failed, or ok) and keeps the
 // backend gauge accurate via a single deferred cleanup.
+//
+// Stream semantics are allowHalfOpen=false: when either copy direction ends
+// (EOF, idle timeout, or error), both connections are closed after
+// propagating any possible CloseWrite. A pinned stream is never migrated to
+// another backend.
 func (s *Server) HandleConn(client net.Conn) {
 	defer s.wg.Done()
 	id := s.conns.Add(1)
@@ -123,20 +171,28 @@ func (s *Server) HandleConn(client net.Conn) {
 	}()
 
 	s.log.Info("proxy start", "conn", id, "backend", be.Addr)
-	deadline := time.Now().Add(s.idleTimeout)
-	_ = client.SetDeadline(deadline)
-	_ = up.SetDeadline(deadline)
+	// Inactivity deadlines: each copy direction refreshes its own
+	// read/write timers on progress, so a continuously active stream
+	// never expires while a fully idle one closes after idleTimeout.
+	start := time.Now().Add(s.idleTimeout)
+	_ = client.SetReadDeadline(start)
+	_ = client.SetWriteDeadline(start)
+	_ = up.SetReadDeadline(start)
+	_ = up.SetWriteDeadline(start)
 
 	var tx, rx atomic.Int64
+	var errC2B, errB2C error
 	done := make(chan struct{}, 2)
 	go func() {
-		n, _ := io.Copy(up, client)
+		var n int64
+		n, errC2B = io.Copy(writeIdle{up, s.idleTimeout}, readIdle{client, s.idleTimeout})
 		tx.Add(n)
 		closeWrite(up)
 		done <- struct{}{}
 	}()
 	go func() {
-		n, _ := io.Copy(client, up)
+		var n int64
+		n, errB2C = io.Copy(writeIdle{client, s.idleTimeout}, readIdle{up, s.idleTimeout})
 		rx.Add(n)
 		closeWrite(client)
 		done <- struct{}{}
@@ -148,5 +204,15 @@ func (s *Server) HandleConn(client net.Conn) {
 	s.m.AddTx(label, float64(tx.Load()))
 	s.m.AddRx(label, float64(rx.Load()))
 	s.m.ConnResult(label, "ok")
-	s.log.Info("proxy done", "conn", id, "backend", be.Addr)
+	doneAttrs := []any{"conn", id, "backend", be.Addr, "tx", tx.Load(), "rx", rx.Load()}
+	switch {
+	case isIdleTimeout(errC2B) || isIdleTimeout(errB2C):
+		s.log.Info("proxy done: idle timeout", append(doneAttrs,
+			"c2bErr", errString(errC2B), "b2cErr", errString(errB2C))...)
+	case errC2B != nil || errB2C != nil:
+		s.log.Warn("proxy done: stream error", append(doneAttrs,
+			"c2bErr", errString(errC2B), "b2cErr", errString(errB2C))...)
+	default:
+		s.log.Info("proxy done", doneAttrs...)
+	}
 }
