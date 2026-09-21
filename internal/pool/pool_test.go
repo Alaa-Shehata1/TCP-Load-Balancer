@@ -20,6 +20,27 @@ func TestHealthy_AllByDefault(t *testing.T) {
 	}
 }
 
+// TestNew_DedupesDuplicateAddrs documents the defensive rule: config.Load
+// rejects duplicates, but direct pool construction must not create the same
+// backend twice (which would skew round-robin and duplicate listings).
+func TestNew_DedupesDuplicateAddrs(t *testing.T) {
+	p := New([]config.BackendConfig{
+		{Name: "a", Addr: "127.0.0.1:9001"},
+		{Name: "a-dup", Addr: "127.0.0.1:9001"},
+		{Name: "b", Addr: "127.0.0.1:9002"},
+	})
+	all := p.All()
+	if len(all) != 2 {
+		t.Fatalf("want 2 backends got %d", len(all))
+	}
+	if all[0].Addr != "127.0.0.1:9001" || all[1].Addr != "127.0.0.1:9002" {
+		t.Fatalf("order not preserved: %v", all)
+	}
+	if got := len(p.Healthy()); got != 2 {
+		t.Fatalf("want 2 healthy got %d", got)
+	}
+}
+
 func TestMarkUnhealthy_Excluded(t *testing.T) {
 	p := New(testBackends())
 	p.MarkUnhealthy("127.0.0.1:9001")

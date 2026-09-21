@@ -37,10 +37,16 @@ type Pool struct {
 	order  []string
 }
 
-// New builds a pool with all backends healthy.
+// New builds a pool with all backends healthy, preserving config order.
+// config.Load rejects duplicate addresses; as a defensive rule for direct
+// callers, later entries with an already-seen address are skipped so one
+// backend can never appear twice.
 func New(cfgs []config.BackendConfig) *Pool {
 	p := &Pool{byAddr: make(map[string]*Backend, len(cfgs))}
 	for _, c := range cfgs {
+		if _, ok := p.byAddr[c.Addr]; ok {
+			continue
+		}
 		p.byAddr[c.Addr] = &Backend{Name: c.Name, Addr: c.Addr, healthy: true}
 		p.order = append(p.order, c.Addr)
 	}
